@@ -2,6 +2,14 @@
 #define GUARD_PTR_H_INCLUDED
 #include <atomic>
 
+#if defined(_DEBUG) || defined(DEBUG)
+#define ASSERT_THREAD_SAFE 1
+#endif
+
+#if ASSERT_THREAD_SAFE
+#include <thread>
+#endif
+
 // There are some types of raw pointers which we can not use such smart pointer as std::shared_ptr to protect/manage,
 // such as pointers to UI/Widget objects which are generally already managed(especially destroying) by a corresponding framework like Qt etc,
 // so here we implement another smart pointer to protect/guard such pointers(to detect whether the pointed object was already destroyed/deleted), 
@@ -12,10 +20,19 @@ namespace guard
 	template<typename T>
 	struct guard_block
 	{
-		guard_block(T* ptr, unsigned int ref)
+		guard_block(T* ptr, unsigned int ref
+#if ASSERT_THREAD_SAFE
+		, const std::thread::id& host_thread_id)
+#else
+		)
+#endif
 		{
 			ptr_.store(static_cast<T*>(ptr));
 			ref_.store(2);
+
+#if ASSERT_THREAD_SAFE
+			host_thread_id_ = host_thread_id;
+#endif
 		}
 
 		inline ~guard_block() {}
@@ -24,16 +41,24 @@ namespace guard
 
 		void acquire()
 		{
-			// fetch_add return the OLD value of block_ before addition
+#if ASSERT_THREAD_SAFE
+			assert(host_thread_id_ == std::this_thread::get_id());
+#endif
+
+			// fetch_add return the OLD value of ref_ before addition
 			// OLD + 1 --> return OLD
 			ref_.fetch_add(1);
 		}
 
 		bool release()
 		{
-			// fetch_add return the OLD value of block_ before subtraction
+#if ASSERT_THREAD_SAFE
+			assert(host_thread_id_ == std::this_thread::get_id());
+#endif
+
+			// fetch_add return the OLD value of ref_ before subtraction
 			// OLD - 1 --> return OLD
-			// true: still alive (block_ is sill greater than 0), false: block_ is 0 and self is deleted.
+			// true: still alive (ref_ is sill greater than 0 after subtraction), false: ref_ is 0 after subtraction and self is deleted.
 			if (ref_.fetch_sub(1) == 1)
 			{
 				delete this; // CAN NO LONGER access me by the external calling pointer or reference which turns to be DANGLING !!!
@@ -46,6 +71,9 @@ namespace guard
 
 		std::atomic<T*> ptr_{ nullptr };
 		std::atomic<unsigned int> ref_{ 0 };
+#if ASSERT_THREAD_SAFE
+		std::thread::id host_thread_id_;
+#endif
 	};
 
 	template<typename T>
@@ -58,6 +86,10 @@ namespace guard
 		{
 			return internalGetAndRef(ptr);
 		}
+
+#if ASSERT_THREAD_SAFE
+		support_guard_ptr() : host_thread_id_(std::this_thread::get_id()) {}
+#endif
 
 		inline ~support_guard_ptr()
 		{
@@ -84,6 +116,10 @@ namespace guard
 		// CRTP: T : public support_guard_ptr<T>, T* can convert to support_guard_ptr<T>*
 		static guard_block_t* internalGetAndRef(support_guard_ptr<T>* base)
 		{
+#if ASSERT_THREAD_SAFE
+			assert(base->host_thread_id_ == std::this_thread::get_id());
+#endif
+
 			guard_block_t* block_ptr = base->block_.load();
 
 			if (block_ptr)
@@ -92,7 +128,12 @@ namespace guard
 			}
 			else
 			{
-				block_ptr = new guard_block_t(static_cast<T*>(base), 2); // 2: 1 held by support_guard_ptr self, 1 for the first guard_ptr !!!
+				// 2: 1 held by support_guard_ptr self, 1 for the first guard_ptr !!!
+				block_ptr = new guard_block_t(static_cast<T*>(base), 2
+#if ASSERT_THREAD_SAFE
+					, base->host_thread_id_
+#endif
+				); 
 
 				guard_block_t* block_ptr_held{ nullptr };
 				if (!base->block_.compare_exchange_strong(block_ptr_held, block_ptr))
@@ -114,6 +155,10 @@ namespace guard
 
 	private:
 		std::atomic<guard_block_t*> block_{ nullptr };
+
+#if ASSERT_THREAD_SAFE
+		std::thread::id host_thread_id_;
+#endif
 	};
 
 	template<typename T>
